@@ -22,7 +22,10 @@ export async function listarMunicipiosPorUF(req: Request, res: Response) {
 
   const result = await pool.query(
     `
-    SELECT m.nome, m.ibge
+    SELECT
+      m.id AS municipio_id,
+      m.nome,
+      m.ibge
     FROM recursos.municipios m
     JOIN recursos.estados e ON e.id = m.estado_id
     WHERE e.uf = $1
