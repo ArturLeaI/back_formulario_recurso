@@ -1,8 +1,9 @@
 import { Router } from "express";
-import { validarGestor } from "../controllers/gestores.controller";
+import { criarOuBuscarGestor } from "../controllers/gestores.controller";
 
 const router = Router();
 
-router.post("/validar", validarGestor);
+router.post("/validar", criarOuBuscarGestor);
+
 
 export default router;

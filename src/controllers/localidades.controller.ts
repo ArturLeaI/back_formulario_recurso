@@ -14,10 +14,32 @@ export async function listarEstados(req: Request, res: Response) {
 
 // 🔹 Lista municípios por UF
 export async function listarMunicipiosPorUF(req: Request, res: Response) {
-  const { uf } = req.query;
+  const ufRaw = req.query.uf;
+  const statusRaw = req.query.estabelecimento_status; // "ADERIDO" | "NAO_ADERIDO" (opcional)
 
-  if (!uf) {
+  if (!ufRaw) {
     return res.status(400).json({ error: "UF é obrigatória" });
+  }
+
+  const uf = String(ufRaw).trim().toUpperCase();
+  const status = String(statusRaw || "").trim().toUpperCase();
+
+  // Só aceita esses 2 valores (se vier outra coisa, ignora filtro)
+  const filtrarPorStatus = status === "ADERIDO" || status === "NAO_ADERIDO";
+
+  const params: any[] = [uf];
+  let filtroStatusSql = "";
+
+  if (filtrarPorStatus) {
+    params.push(status);
+    filtroStatusSql = `
+      AND EXISTS (
+        SELECT 1
+        FROM recursos.estabelecimentos es
+        WHERE es.municipio_id = m.id
+          AND es.status_adesao = $2
+      )
+    `;
   }
 
   const result = await pool.query(
@@ -29,9 +51,10 @@ export async function listarMunicipiosPorUF(req: Request, res: Response) {
     FROM recursos.municipios m
     JOIN recursos.estados e ON e.id = m.estado_id
     WHERE e.uf = $1
+    ${filtroStatusSql}
     ORDER BY m.nome
     `,
-    [uf]
+    params
   );
 
   res.json(result.rows);
