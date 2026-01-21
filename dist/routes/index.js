@@ -1,0 +1,16 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const localidades_routes_1 = __importDefault(require("./localidades.routes"));
+const gestores_routes_1 = __importDefault(require("./gestores.routes"));
+const estabelecimentos_routes_1 = __importDefault(require("./estabelecimentos.routes"));
+const acoes_vagas_routes_1 = __importDefault(require("./acoes-vagas.routes"));
+const routes = (0, express_1.Router)();
+routes.use("/localidades", localidades_routes_1.default);
+routes.use("/gestores", gestores_routes_1.default);
+routes.use("/estabelecimentos", estabelecimentos_routes_1.default);
+routes.use("/recursos", acoes_vagas_routes_1.default);
+exports.default = routes;
