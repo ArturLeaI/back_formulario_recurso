@@ -2,6 +2,18 @@
 import { Request, Response } from "express";
 import { pool } from "../db/pool";
 
+/**
+ * ✅ Controller completo com Mudança de Curso funcionando (novo + compat antigo)
+ * - Aceita:
+ *   (A) novo formato: cursosRemover[] e cursosAdicionar[]
+ *   (B) compat: cursos[] com operacao: "REMOVER" | "ADICIONAR"
+ * - Valida:
+ *   - CNES único (mesmo estabelecimento) em toda mudança
+ *   - totalRemover === totalAdicionar
+ *   - diminuir não pode exceder saldo solicitado
+ *   - aumentar não pode exceder teto (saldo disponível do teto)
+ */
+
 function normalizeUpper(value: unknown) {
   return String(value ?? "").trim().replace(/\s+/g, " ").toUpperCase();
 }
@@ -11,14 +23,10 @@ function mapTipoAcao(tipoAcaoRaw: unknown) {
 
   if (v === "AUMENTAR VAGAS" || v === "AUMENTAR_VAGAS") return "AUMENTAR_VAGAS";
   if (v === "DIMINUIR VAGAS" || v === "DIMINUIR_VAGAS") return "DIMINUIR_VAGAS";
-  if (v === "MUDANCA_CURSO" || v === "MUDANÇA DE CURSO" || v === "MUDANCA CURSO")
-    return "MUDANCA_CURSO";
-  if (v === "INCLUIR_APRIMORAMENTO" || v === "INCLUIR APRIMORAMENTO")
-    return "INCLUIR_APRIMORAMENTO";
-  if (v === "ADESAO_EDITAL" || v === "ADESAO EDITAL" || v === "ADESÃO POR PERDA DE PRAZO")
-    return "ADESAO_EDITAL";
-  if (v === "DESCREDENCIAR VAGA" || v === "DESCREDENCIAR_VAGA" || v === "DESISTIR DA ADESAO")
-    return "DESCREDENCIAR_VAGA";
+  if (v === "MUDANCA_CURSO" || v === "MUDANÇA DE CURSO" || v === "MUDANCA CURSO") return "MUDANCA_CURSO";
+  if (v === "INCLUIR_APRIMORAMENTO" || v === "INCLUIR APRIMORAMENTO") return "INCLUIR_APRIMORAMENTO";
+  if (v === "ADESAO_EDITAL" || v === "ADESAO EDITAL" || v === "ADESÃO POR PERDA DE PRAZO") return "ADESAO_EDITAL";
+  if (v === "DESCREDENCIAR VAGA" || v === "DESCREDENCIAR_VAGA" || v === "DESISTIR DA ADESAO") return "DESCREDENCIAR_VAGA";
 
   return v;
 }
@@ -29,10 +37,335 @@ type CursoBody = {
   quantidade: any;
   cnes?: string;
   estabelecimento?: string;
+  operacao?: "REMOVER" | "ADICIONAR" | string;
 };
 
 function isFinitePositive(n: number) {
   return Number.isFinite(n) && n > 0;
+}
+
+function toInt(v: unknown) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+/**
+ * Saldo "solicitado" do curso baseado nas ações:
+ * AUMENTAR_VAGAS - DIMINUIR_VAGAS (mesmo estabelecimento + curso).
+ * Compatível com registros antigos com espaço.
+ */
+async function getSaldoSolicitadoCurso(client: any, cursoId: number, estabelecimentoId: number): Promise<number> {
+  const r = await client.query(
+    `
+    SELECT
+      COALESCE(SUM(CASE WHEN tipo_acao IN ('AUMENTAR_VAGAS','AUMENTAR VAGAS') THEN quantidade ELSE 0 END), 0)
+      - COALESCE(SUM(CASE WHEN tipo_acao IN ('DIMINUIR_VAGAS','DIMINUIR VAGAS') THEN quantidade ELSE 0 END), 0)
+      AS saldo
+    FROM recursos.acoes_vagas
+    WHERE curso_id = $1
+      AND estabelecimento_id = $2;
+    `,
+    [cursoId, estabelecimentoId]
+  );
+
+  return Math.max(Number(r.rows[0]?.saldo ?? 0), 0);
+}
+
+async function getTetoCurso(client: any, cursoId: number): Promise<number> {
+  const r = await client.query(`SELECT vagas FROM recursos.cursos WHERE id = $1`, [cursoId]);
+  return Number(r.rows[0]?.vagas ?? 0);
+}
+
+/**
+ * Valida ações que consomem o teto:
+ * - AUMENTAR_VAGAS
+ * - INCLUIR_APRIMORAMENTO
+ * - ADESAO_EDITAL
+ *
+ * cursos.vagas = TETO fixo
+ * disponivel = teto - saldoSolicitadoAtual
+ *
+ * IMPORTANTE: assume que a ação atual ainda NÃO foi inserida.
+ */
+async function validarConsumoDeTeto(params: {
+  client: any;
+  tipoAcao: string;
+  cursoId: number;
+  estabelecimentoId: number;
+  quantidade: number;
+}) {
+  const { client, tipoAcao, cursoId, estabelecimentoId, quantidade } = params;
+
+  const consomeTeto =
+    tipoAcao === "AUMENTAR_VAGAS" ||
+    tipoAcao === "INCLUIR_APRIMORAMENTO" ||
+    tipoAcao === "ADESAO_EDITAL";
+
+  if (!consomeTeto) return;
+
+  const saldoAntes = await getSaldoSolicitadoCurso(client, cursoId, estabelecimentoId);
+  const teto = await getTetoCurso(client, cursoId);
+  const disponivel = Math.max(teto - saldoAntes, 0);
+
+  if (disponivel <= 0) throw new Error("Não há saldo disponível para aumentar");
+  if (quantidade > disponivel) throw new Error(`Você só pode aumentar até ${disponivel}`);
+}
+
+/** Resolve estabelecimento por CNES */
+async function getEstByCnes(client: any, cnesValue: string) {
+  const r = await client.query(
+    `
+    SELECT id, cnes, municipio_id, nome
+    FROM recursos.estabelecimentos
+    WHERE cnes = $1
+    LIMIT 1
+    `,
+    [cnesValue]
+  );
+  return r.rows[0] ?? null;
+}
+
+/** Resolve município (id) */
+async function resolveMunicipioId(client: any, municipio_id: any, municipioSelecionado: any) {
+  let municipioId: number | null = null;
+
+  if (municipio_id != null && String(municipio_id).trim() !== "") {
+    const mid = Number(municipio_id);
+    if (!Number.isFinite(mid)) throw new Error("municipio_id inválido");
+
+    const r = await client.query(`SELECT id, estado_id FROM recursos.municipios WHERE id = $1`, [mid]);
+    if (r.rows.length === 0) throw new Error("Município (municipio_id) não encontrado");
+    municipioId = Number(r.rows[0].id);
+  } else if (municipioSelecionado) {
+    const municipioNome = String(municipioSelecionado).trim();
+    const r = await client.query(
+      `
+      SELECT id, estado_id
+      FROM recursos.municipios
+      WHERE UPPER(nome) = UPPER($1)
+      LIMIT 1
+      `,
+      [municipioNome]
+    );
+    if (r.rows.length === 0) throw new Error("Município não encontrado");
+    municipioId = Number(r.rows[0].id);
+  }
+
+  if (!municipioId) throw new Error("Município é obrigatório");
+  return municipioId;
+}
+
+async function validarUfDoMunicipio(client: any, municipioId: number, ufNorm: string) {
+  const ufCheck = await client.query(
+    `
+    SELECT e.uf
+    FROM recursos.municipios m
+    JOIN recursos.estados e ON e.id = m.estado_id
+    WHERE m.id = $1
+    `,
+    [municipioId]
+  );
+
+  const ufDoMunicipio = normalizeUpper(ufCheck.rows[0]?.uf ?? "");
+  if (ufDoMunicipio && ufDoMunicipio !== ufNorm) {
+    throw new Error(`UF selecionada (${ufNorm}) não bate com UF do município (${ufDoMunicipio})`);
+  }
+}
+
+/** Resolve cursoId (por id ou por nome no estabelecimento). Pode criar no incluir_aprimoramento */
+async function resolveCursoId(params: {
+  client: any;
+  tipoAcao: string;
+  curso: CursoBody;
+  estabelecimentoId: number;
+}) {
+  const { client, tipoAcao, curso, estabelecimentoId } = params;
+
+  let cursoId: number | null = null;
+
+  // (A) por id numérico
+  const idNum = toInt(curso.id);
+  if (Number.isFinite(idNum) && String(curso.id).trim() !== "") {
+    const r = await client.query(`SELECT id, estabelecimento_id FROM recursos.cursos WHERE id = $1`, [idNum]);
+    if (r.rows.length > 0) {
+      if (Number(r.rows[0].estabelecimento_id) !== estabelecimentoId) {
+        throw new Error("Curso não pertence ao estabelecimento selecionado");
+      }
+      cursoId = Number(r.rows[0].id);
+    }
+  }
+
+  // (B) por nome dentro do estabelecimento
+  if (!cursoId) {
+    const nomeCurso = String(curso.nome ?? curso.id ?? "").trim();
+    if (!nomeCurso) throw new Error("Curso sem id/nome válido");
+
+    const r = await client.query(
+      `
+      SELECT id
+      FROM recursos.cursos
+      WHERE estabelecimento_id = $1
+        AND UPPER(nome) = UPPER($2)
+      LIMIT 1
+      `,
+      [estabelecimentoId, nomeCurso]
+    );
+
+    if (r.rows.length > 0) {
+      cursoId = Number(r.rows[0].id);
+    } else {
+      // só cria no INCLUIR_APRIMORAMENTO
+      if (tipoAcao !== "INCLUIR_APRIMORAMENTO") {
+        throw new Error(`Curso "${nomeCurso}" não existe no estabelecimento`);
+      }
+
+      const created = await client.query(
+        `
+        INSERT INTO recursos.cursos (nome, vagas, estabelecimento_id)
+        VALUES ($1, 0, $2)
+        RETURNING id
+        `,
+        [nomeCurso, estabelecimentoId]
+      );
+
+      cursoId = Number(created.rows[0].id);
+    }
+  }
+
+  return cursoId;
+}
+
+/**
+ * ✅ MUDANCA_CURSO por operação:
+ * - REMOVER => gera DIMINUIR_VAGAS
+ * - ADICIONAR => gera AUMENTAR_VAGAS
+ *
+ * Aceita:
+ *  - cursosArr (compat antigo) com operacao
+ *  - cursosRemover / cursosAdicionar (novo formato)
+ */
+async function processarMudancaCursoPorOperacao(params: {
+  client: any;
+  gestorId: number;
+  ufNorm: string;
+  municipioId: number;
+  cursosArr?: CursoBody[];
+  cursosRemover?: CursoBody[];
+  cursosAdicionar?: CursoBody[];
+}) {
+  const { client, gestorId, ufNorm, municipioId } = params;
+
+  // 0) Normaliza entrada
+  let removerRaw: CursoBody[] = Array.isArray(params.cursosRemover) ? params.cursosRemover : [];
+  let adicionarRaw: CursoBody[] = Array.isArray(params.cursosAdicionar) ? params.cursosAdicionar : [];
+
+  // fallback: se não veio no novo formato, tenta pelo antigo (cursosArr com operacao)
+  if (removerRaw.length === 0 && adicionarRaw.length === 0) {
+    const cursosArr = Array.isArray(params.cursosArr) ? params.cursosArr : [];
+    removerRaw = cursosArr.filter((c) => normalizeUpper(c.operacao) === "REMOVER");
+    adicionarRaw = cursosArr.filter((c) => normalizeUpper(c.operacao) === "ADICIONAR");
+  }
+
+  if (removerRaw.length === 0 && adicionarRaw.length === 0) {
+    throw new Error("Em Mudança de Curso, informe ao menos um curso para REMOVER e/ou ADICIONAR.");
+  }
+
+  // 1) valida CNES único (mesmo estabelecimento) considerando remover+adicionar
+  const all = [...removerRaw, ...adicionarRaw];
+  const cnesSet = new Set(all.map((c) => String(c.cnes ?? "").trim()).filter((x) => x.length > 0));
+
+  if (cnesSet.size !== 1) {
+    throw new Error("Mudança de curso deve conter cursos de um único estabelecimento (mesmo CNES).");
+  }
+
+  const cnesUnico = [...cnesSet][0];
+  const est = await getEstByCnes(client, cnesUnico);
+  if (!est) throw new Error(`Estabelecimento CNES "${cnesUnico}" não encontrado`);
+  if (Number(est.municipio_id) !== Number(municipioId)) {
+    throw new Error("Estabelecimento não pertence ao município selecionado");
+  }
+  const estabelecimentoId = Number(est.id);
+
+  // 2) helper: soma por cursoId
+  const somaPorCurso = async (arr: CursoBody[]) => {
+    const map = new Map<number, number>();
+
+    for (const item of arr) {
+      const qtd = Number(item.quantidade);
+      if (!Number.isFinite(qtd) || qtd <= 0) {
+        throw new Error(`Quantidade inválida para o curso "${item.nome ?? item.id}"`);
+      }
+
+      const cursoId = await resolveCursoId({
+        client,
+        tipoAcao: "MUDANCA_CURSO",
+        curso: item,
+        estabelecimentoId,
+      });
+
+      map.set(cursoId, (map.get(cursoId) ?? 0) + qtd);
+    }
+
+    return map;
+  };
+
+  const removerMap = await somaPorCurso(removerRaw);
+  const adicionarMap = await somaPorCurso(adicionarRaw);
+
+  const totalRemover = [...removerMap.values()].reduce((s, v) => s + v, 0);
+  const totalAdicionar = [...adicionarMap.values()].reduce((s, v) => s + v, 0);
+
+  // ✅ regra: manter total de vagas
+  if (totalRemover !== totalAdicionar) {
+    throw new Error(
+      `Mudança de curso precisa manter o total de vagas: diminuir=${totalRemover} e aumentar=${totalAdicionar}.`
+    );
+  }
+
+  // 3) prepara ops
+  const ops: Array<{ tipo: "AUMENTAR_VAGAS" | "DIMINUIR_VAGAS"; cursoId: number; qtd: number }> = [];
+
+  for (const [cursoId, qtd] of removerMap.entries()) ops.push({ tipo: "DIMINUIR_VAGAS", cursoId, qtd });
+  for (const [cursoId, qtd] of adicionarMap.entries()) ops.push({ tipo: "AUMENTAR_VAGAS", cursoId, qtd });
+
+  // 4) executa (diminui primeiro)
+  const acaoIdsCriados: number[] = [];
+  ops.sort((a, b) => (a.tipo === "DIMINUIR_VAGAS" ? -1 : 1) - (b.tipo === "DIMINUIR_VAGAS" ? -1 : 1));
+
+  for (const op of ops) {
+    if (op.qtd <= 0) continue;
+
+    if (op.tipo === "DIMINUIR_VAGAS") {
+      const saldo = await getSaldoSolicitadoCurso(client, op.cursoId, estabelecimentoId);
+      if (saldo <= 0) throw new Error("Não há vagas solicitadas para diminuir");
+      if (op.qtd > saldo) throw new Error(`Você só pode diminuir até ${saldo}`);
+    }
+
+    if (op.tipo === "AUMENTAR_VAGAS") {
+      await validarConsumoDeTeto({
+        client,
+        tipoAcao: "AUMENTAR_VAGAS",
+        cursoId: op.cursoId,
+        estabelecimentoId,
+        quantidade: op.qtd,
+      });
+    }
+
+    const created = await client.query(
+      `
+      INSERT INTO recursos.acoes_vagas
+        (gestor_id, tipo_acao, uf, municipio_id, estabelecimento_id, curso_id, quantidade, data_criacao)
+      VALUES
+        ($1, $2, $3, $4, $5, $6, $7, NOW())
+      RETURNING id
+      `,
+      [gestorId, op.tipo, ufNorm, municipioId, estabelecimentoId, op.cursoId, op.qtd]
+    );
+
+    acaoIdsCriados.push(Number(created.rows[0].id));
+  }
+
+  return { estabelecimentoId, acaoIdsCriados };
 }
 
 export async function listarCursosPorEstabelecimento(req: Request, res: Response) {
@@ -48,20 +381,29 @@ export async function listarCursosPorEstabelecimento(req: Request, res: Response
       SELECT
         c.id,
         c.nome,
-        c.vagas,
+        c.vagas, -- teto (fixo)
         GREATEST(
-          COALESCE(SUM(CASE WHEN av.tipo_acao = 'AUMENTAR_VAGAS' THEN av.quantidade ELSE 0 END), 0)
-          - COALESCE(SUM(CASE WHEN av.tipo_acao = 'DIMINUIR_VAGAS' THEN av.quantidade ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN av.tipo_acao IN ('AUMENTAR_VAGAS','AUMENTAR VAGAS') THEN av.quantidade ELSE 0 END), 0)
+          - COALESCE(SUM(CASE WHEN av.tipo_acao IN ('DIMINUIR_VAGAS','DIMINUIR VAGAS') THEN av.quantidade ELSE 0 END), 0),
           0
-        ) AS "vagasSolicitadas"
+        ) AS "vagasSolicitadas",
+        GREATEST(
+          c.vagas
+          - GREATEST(
+              COALESCE(SUM(CASE WHEN av.tipo_acao IN ('AUMENTAR_VAGAS','AUMENTAR VAGAS') THEN av.quantidade ELSE 0 END), 0)
+              - COALESCE(SUM(CASE WHEN av.tipo_acao IN ('DIMINUIR_VAGAS','DIMINUIR VAGAS') THEN av.quantidade ELSE 0 END), 0),
+              0
+            ),
+          0
+        ) AS vagas_disponiveis
       FROM recursos.cursos c
       LEFT JOIN recursos.acoes_vagas av
         ON av.curso_id = c.id
-      AND av.estabelecimento_id = $1
+       AND av.estabelecimento_id = $1
       WHERE c.estabelecimento_id = $1
       GROUP BY c.id, c.nome, c.vagas
-      ORDER BY c.nome
-  `,
+      ORDER BY c.nome;
+      `,
       [estabelecimentoId]
     );
 
@@ -72,33 +414,13 @@ export async function listarCursosPorEstabelecimento(req: Request, res: Response
   }
 }
 
-async function getSaldoSolicitadoCurso(
-  client: any,
-  cursoId: number,
-  estabelecimentoId: number
-): Promise<number> {
-  const r = await client.query(
-    `
-    SELECT
-      COALESCE(SUM(CASE WHEN tipo_acao IN ('AUMENTAR_VAGAS','AUMENTAR VAGAS') THEN quantidade ELSE 0 END), 0)
-      - COALESCE(SUM(CASE WHEN tipo_acao IN ('DIMINUIR_VAGAS','DIMINUIR VAGAS') THEN quantidade ELSE 0 END), 0)
-      AS saldo
-    FROM recursos.acoes_vagas
-    WHERE curso_id = $1
-      AND estabelecimento_id = $2;
-    `,
-    [cursoId, estabelecimentoId]
-  );
-  return Number(r.rows[0]?.saldo ?? 0);
-}
-
 export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Response) {
   const client = await pool.connect();
 
   const rollbackAndReturn = async (status: number, payload: any) => {
     try {
       await client.query("ROLLBACK");
-    } catch { }
+    } catch {}
     return res.status(status).json(payload);
   };
 
@@ -110,10 +432,10 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
       municipioSelecionado,
       municipio_id,
       cursos,
+      cursosRemover,
+      cursosAdicionar,
       gestorId,
-
-      // ✅ para desistir
-      cnes, // CNES do estabelecimento a descredenciar
+      cnes,
     } = req.body;
 
     if (!tipoAcaoRaw) return res.status(400).json({ ok: false, error: "Tipo de ação é obrigatório" });
@@ -121,12 +443,10 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
 
     const tipoAcao = mapTipoAcao(tipoAcaoRaw);
 
-    // =========================
-    // Validação básica UF
-    // =========================
     const ufNorm = normalizeUpper(ufSelecionada);
     if (!ufNorm) return res.status(400).json({ ok: false, error: "UF é obrigatória" });
 
+    // cursos compat (antigo)
     const cursosArr: CursoBody[] = Array.isArray(cursos) ? cursos : [];
 
     // DESCREDENCIAR: não exige cursos
@@ -137,8 +457,16 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
       if (!cnes || !String(cnes).trim()) {
         return res.status(400).json({ ok: false, error: "CNES do estabelecimento é obrigatório para desistir da adesão" });
       }
+    } else if (tipoAcao === "MUDANCA_CURSO") {
+      // ✅ em mudança, não exige cursosArr, pode vir no novo formato
+      const rem = Array.isArray(cursosRemover) ? cursosRemover : [];
+      const add = Array.isArray(cursosAdicionar) ? cursosAdicionar : [];
+      const temAlgo = rem.length > 0 || add.length > 0 || cursosArr.some((c) => String(c.operacao ?? "").trim() !== "");
+      if (!temAlgo) {
+        return res.status(400).json({ ok: false, error: "Informe ao menos um curso para mudança" });
+      }
     } else {
-      // outras ações exigem cursos
+      // demais ações precisam ter cursos
       if (cursosArr.length === 0) {
         return res.status(400).json({ ok: false, error: "Informe ao menos um curso" });
       }
@@ -146,94 +474,37 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
 
     await client.query("BEGIN");
 
-    // =========================
-    // Valida gestor existe
-    // =========================
-    const gestorCheck = await client.query(
-      `SELECT id, cpf, nome, email FROM recursos.gestores WHERE id = $1`,
-      [Number(gestorId)]
-    );
+    // Valida gestor
+    const gestorCheck = await client.query(`SELECT id, cpf, nome, email FROM recursos.gestores WHERE id = $1`, [
+      Number(gestorId),
+    ]);
     if (gestorCheck.rows.length === 0) {
       return rollbackAndReturn(400, { ok: false, error: "gestorId não encontrado" });
     }
 
-    // =========================
     // Resolve municipio_id
-    // =========================
-    let municipioId: number | null = null;
-
-    if (municipio_id != null && String(municipio_id).trim() !== "") {
-      const mid = Number(municipio_id);
-      if (!Number.isFinite(mid)) return rollbackAndReturn(400, { ok: false, error: "municipio_id inválido" });
-
-      const r = await client.query(`SELECT id, estado_id FROM recursos.municipios WHERE id = $1`, [mid]);
-      if (r.rows.length === 0) return rollbackAndReturn(400, { ok: false, error: "Município (municipio_id) não encontrado" });
-
-      municipioId = r.rows[0].id;
-    } else if (municipioSelecionado) {
-      const municipioNome = String(municipioSelecionado).trim();
-      const r = await client.query(
-        `
-        SELECT id, estado_id
-        FROM recursos.municipios
-        WHERE UPPER(nome) = UPPER($1)
-        LIMIT 1
-        `,
-        [municipioNome]
-      );
-      if (r.rows.length === 0) return rollbackAndReturn(400, { ok: false, error: "Município não encontrado" });
-
-      municipioId = r.rows[0].id;
+    let municipioId: number;
+    try {
+      municipioId = await resolveMunicipioId(client, municipio_id, municipioSelecionado);
+    } catch (err: any) {
+      return rollbackAndReturn(400, { ok: false, error: err?.message || "Município inválido" });
     }
 
-    if (!municipioId) {
-      return rollbackAndReturn(400, { ok: false, error: "Município é obrigatório" });
-    }
-
-    // =========================
     // Valida UF x município
-    // =========================
-    const ufCheck = await client.query(
-      `
-      SELECT e.uf
-      FROM recursos.municipios m
-      JOIN recursos.estados e ON e.id = m.estado_id
-      WHERE m.id = $1
-      `,
-      [municipioId]
-    );
-
-    const ufDoMunicipio = normalizeUpper(ufCheck.rows[0]?.uf ?? "");
-    if (ufDoMunicipio && ufDoMunicipio !== ufNorm) {
-      return rollbackAndReturn(400, {
-        ok: false,
-        error: `UF selecionada (${ufNorm}) não bate com UF do município (${ufDoMunicipio})`,
-      });
+    try {
+      await validarUfDoMunicipio(client, municipioId, ufNorm);
+    } catch (err: any) {
+      return rollbackAndReturn(400, { ok: false, error: err?.message || "UF inválida" });
     }
 
-    // =========================
-    // Helper: resolve estabelecimento por CNES
-    // =========================
-    const getEstByCnes = async (cnesValue: string) => {
-      const r = await client.query(
-        `
-        SELECT id, cnes, municipio_id, nome
-        FROM recursos.estabelecimentos
-        WHERE cnes = $1
-        LIMIT 1
-        `,
-        [cnesValue]
-      );
-      return r.rows[0] ?? null;
-    };
-
-    // =========================
     // DESCREDENCIAR_VAGA
-    // =========================
     if (tipoAcao === "DESCREDENCIAR_VAGA") {
       const cnesValue = String(cnes).trim();
-      const est = await getEstByCnes(cnesValue);
-      if (!est) return rollbackAndReturn(400, { ok: false, error: `Estabelecimento CNES "${cnesValue}" não encontrado` });
+      const est = await getEstByCnes(client, cnesValue);
+
+      if (!est) {
+        return rollbackAndReturn(400, { ok: false, error: `Estabelecimento CNES "${cnesValue}" não encontrado` });
+      }
 
       if (Number(est.municipio_id) !== Number(municipioId)) {
         return rollbackAndReturn(400, { ok: false, error: "Estabelecimento não pertence ao município selecionado" });
@@ -260,21 +531,40 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
       });
     }
 
-    // =========================
-    // ✅ Demais ações: NÃO cria "header"
-    // =========================
+    // ✅ MUDANCA_CURSO: traduz em AUMENTAR/DIMINUIR automaticamente
+    if (tipoAcao === "MUDANCA_CURSO") {
+      try {
+        const { acaoIdsCriados, estabelecimentoId } = await processarMudancaCursoPorOperacao({
+          client,
+          gestorId: Number(gestorId),
+          ufNorm,
+          municipioId,
+          cursosArr, // compat antigo
+          cursosRemover: Array.isArray(cursosRemover) ? cursosRemover : undefined, // novo
+          cursosAdicionar: Array.isArray(cursosAdicionar) ? cursosAdicionar : undefined, // novo
+        });
+
+        await client.query("COMMIT");
+
+        return res.status(201).json({
+          ok: true,
+          acao_ids: acaoIdsCriados,
+          estabelecimento_id: estabelecimentoId,
+          gestor: gestorCheck.rows[0],
+          message: "Mudança de curso processada com sucesso (diminuir/aumentar gerados).",
+        });
+      } catch (err: any) {
+        return rollbackAndReturn(400, { ok: false, error: err?.message || "Erro na mudança de curso" });
+      }
+    }
+
+    // ✅ Demais ações: fluxo original (insere tipoAcao diretamente)
     const acaoIdsCriados: number[] = [];
 
-    // =========================
-    // Processa cursos
-    // =========================
     for (const curso of cursosArr) {
       const quantidade = Number(curso.quantidade);
       if (!isFinitePositive(quantidade)) {
-        return rollbackAndReturn(400, {
-          ok: false,
-          error: `Quantidade inválida para o curso "${curso.nome ?? curso.id}"`,
-        });
+        return rollbackAndReturn(400, { ok: false, error: `Quantidade inválida para o curso "${curso.nome ?? curso.id}"` });
       }
 
       const cnesItem = String(curso.cnes ?? "").trim();
@@ -282,8 +572,10 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
         return rollbackAndReturn(400, { ok: false, error: "CNES é obrigatório em cada curso enviado" });
       }
 
-      const est = await getEstByCnes(cnesItem);
-      if (!est) return rollbackAndReturn(400, { ok: false, error: `Estabelecimento CNES "${cnesItem}" não encontrado` });
+      const est = await getEstByCnes(client, cnesItem);
+      if (!est) {
+        return rollbackAndReturn(400, { ok: false, error: `Estabelecimento CNES "${cnesItem}" não encontrado` });
+      }
 
       if (Number(est.municipio_id) !== Number(municipioId)) {
         return rollbackAndReturn(400, {
@@ -295,62 +587,14 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
       const estabelecimentoId = Number(est.id);
 
       // resolve cursoId
-      let cursoId: number | null = null;
-
-      // (A) por id numérico
-      const idNum = Number(curso.id);
-      if (Number.isFinite(idNum) && String(curso.id).trim() !== "") {
-        const r = await client.query(
-          `SELECT id, estabelecimento_id FROM recursos.cursos WHERE id = $1`,
-          [idNum]
-        );
-
-        if (r.rows.length > 0) {
-          if (Number(r.rows[0].estabelecimento_id) !== estabelecimentoId) {
-            return rollbackAndReturn(400, { ok: false, error: "Curso não pertence ao estabelecimento selecionado" });
-          }
-          cursoId = Number(r.rows[0].id);
-        }
+      let cursoId: number;
+      try {
+        cursoId = await resolveCursoId({ client, tipoAcao, curso, estabelecimentoId });
+      } catch (err: any) {
+        return rollbackAndReturn(400, { ok: false, error: err?.message || "Curso inválido" });
       }
 
-      // (B) por nome dentro do estabelecimento
-      if (!cursoId) {
-        const nomeCurso = String(curso.nome ?? curso.id ?? "").trim();
-        if (!nomeCurso) return rollbackAndReturn(400, { ok: false, error: "Curso sem id/nome válido" });
-
-        const r = await client.query(
-          `
-          SELECT id
-          FROM recursos.cursos
-          WHERE estabelecimento_id = $1
-            AND UPPER(nome) = UPPER($2)
-          LIMIT 1
-          `,
-          [estabelecimentoId, nomeCurso]
-        );
-
-        if (r.rows.length > 0) {
-          cursoId = Number(r.rows[0].id);
-        } else {
-          // só cria no INCLUIR_APRIMORAMENTO
-          if (tipoAcao !== "INCLUIR_APRIMORAMENTO") {
-            return rollbackAndReturn(400, { ok: false, error: `Curso "${nomeCurso}" não existe no estabelecimento` });
-          }
-
-          const created = await client.query(
-            `
-            INSERT INTO recursos.cursos (nome, vagas, estabelecimento_id)
-            VALUES ($1, 0, $2)
-            RETURNING id
-            `,
-            [nomeCurso, estabelecimentoId]
-          );
-
-          cursoId = Number(created.rows[0].id);
-        }
-      }
-
-      // ✅ valida DIMINUIR_VAGAS: só pode diminuir o que foi solicitado (saldo)
+      // valida diminuir
       if (tipoAcao === "DIMINUIR_VAGAS") {
         const saldo = await getSaldoSolicitadoCurso(client, cursoId, estabelecimentoId);
         if (saldo <= 0) {
@@ -361,7 +605,13 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
         }
       }
 
-      // ✅ insere linha real em acoes_vagas (agora retornando id)
+      // valida consumo de teto (antes do insert)
+      try {
+        await validarConsumoDeTeto({ client, tipoAcao, cursoId, estabelecimentoId, quantidade });
+      } catch (err: any) {
+        return rollbackAndReturn(400, { ok: false, error: err?.message || "Saldo insuficiente" });
+      }
+
       const createdAcao = await client.query(
         `
         INSERT INTO recursos.acoes_vagas
@@ -374,22 +624,6 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
       );
 
       acaoIdsCriados.push(Number(createdAcao.rows[0].id));
-
-      // atualiza vagas
-      const deveSomar =
-        tipoAcao === "AUMENTAR_VAGAS" ||
-        tipoAcao === "INCLUIR_APRIMORAMENTO" ||
-        tipoAcao === "ADESAO_EDITAL";
-
-      if (deveSomar) {
-        await client.query(`UPDATE recursos.cursos SET vagas = vagas + $1 WHERE id = $2`, [quantidade, cursoId]);
-      }
-
-      if (tipoAcao === "DIMINUIR_VAGAS") {
-        // aqui sua regra é "diminuir apenas as vagas solicitadas", mas você também atualiza vagas do curso.
-        // mantive como você tinha (atualizar vagas), porque o sistema parece tratar "vagas" como total.
-        await client.query(`UPDATE recursos.cursos SET vagas = GREATEST(vagas - $1, 0) WHERE id = $2`, [quantidade, cursoId]);
-      }
     }
 
     await client.query("COMMIT");
@@ -403,7 +637,7 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
   } catch (error: any) {
     try {
       await client.query("ROLLBACK");
-    } catch { }
+    } catch {}
 
     console.error("Erro ao criar ação de vagas:", error);
 
