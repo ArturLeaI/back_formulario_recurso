@@ -11,7 +11,7 @@ routes.use("/localidades", localidadesRoutes);
 routes.use("/gestores", gestoresRoutes);
 routes.use("/estabelecimentos", estabelecimentosRoutes);
 routes.use("/recursos", acoesVagasRoutes);
-// routes.use("/uploads", uploadsRoutes);
+routes.use("/uploads", uploadsRoutes);
 routes.use("/uploads", uploadsRoutes);
 // routes.use("/termo", termoRoutes);
 
