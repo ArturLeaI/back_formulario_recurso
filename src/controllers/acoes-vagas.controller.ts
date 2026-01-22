@@ -96,9 +96,11 @@ async function validarConsumoDeTeto(params: {
 }) {
   const { client, tipoAcao, cursoId, estabelecimentoId, quantidade } = params;
 
+  // ✅ REGRA: incluir_aprimoramento é LIVRE (não valida teto/saldo)
+  if (tipoAcao === "INCLUIR_APRIMORAMENTO") return;
+
   const consomeTeto =
     tipoAcao === "AUMENTAR_VAGAS" ||
-    tipoAcao === "INCLUIR_APRIMORAMENTO" ||
     tipoAcao === "ADESAO_EDITAL";
 
   if (!consomeTeto) return;
@@ -420,7 +422,7 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
   const rollbackAndReturn = async (status: number, payload: any) => {
     try {
       await client.query("ROLLBACK");
-    } catch {}
+    } catch { }
     return res.status(status).json(payload);
   };
 
@@ -637,7 +639,7 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
   } catch (error: any) {
     try {
       await client.query("ROLLBACK");
-    } catch {}
+    } catch { }
 
     console.error("Erro ao criar ação de vagas:", error);
 

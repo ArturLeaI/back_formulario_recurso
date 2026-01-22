@@ -16,7 +16,9 @@
     "cors": "^2.8.5",
     "express": "^5.2.1",
     "multer": "^2.0.2",
+    "mustache": "^4.2.0",
     "pg": "^8.17.1",
+    "puppeteer": "^24.35.0",
     "zod": "^4.3.5"
   },
   "devDependencies": {
