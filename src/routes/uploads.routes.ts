@@ -8,7 +8,7 @@ const router = Router();
 
 // 🔹 DIRETÓRIO LOCAL APENAS PARA TESTE
 // Só será usado quando NODE_ENV !== "production"
-const LOCAL_TEST_DIR = "C:\Users\bella\OneDrive\Imagens";
+const LOCAL_TEST_DIR = path.join(__dirname, "../uploads");
 
 // 🔹 Produção (Railway ou servidor)
 const PROD_DIR = path.join(process.cwd(), "uploads");
