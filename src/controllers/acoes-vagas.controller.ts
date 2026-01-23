@@ -18,6 +18,32 @@ function normalizeUpper(value: unknown) {
   return String(value ?? "").trim().replace(/\s+/g, " ").toUpperCase();
 }
 
+/**
+ * ✅ CNES SEM NORMALIZAÇÃO (NÃO coloca 0 à esquerda)
+ * - remove máscara / caracteres não numéricos
+ * - ✅ ALTERADO: aceita QUALQUER quantidade de dígitos (>= 1)
+ * - caso contrário: ""
+ */
+function sanitizeCnes(value: unknown): string {
+  const raw = String(value ?? "")
+    .trim()
+    .replace(/\D/g, "");
+
+  // ✅ ALTERADO
+  if (raw.length >= 1) return raw;
+  return "";
+}
+
+// ✅ ALTERADO: agora só checa se tem algum dígito
+function isValidCnes(value: unknown) {
+  return sanitizeCnes(value).length >= 1;
+}
+
+// ✅ ALTERADO: mantive o nome pra não quebrar chamadas, mas agora valida "qualquer tamanho"
+function isValidCnes6or7(value: unknown) {
+  return isValidCnes(value);
+}
+
 function mapTipoAcao(tipoAcaoRaw: unknown) {
   const v = normalizeUpper(tipoAcaoRaw);
 
@@ -26,7 +52,8 @@ function mapTipoAcao(tipoAcaoRaw: unknown) {
   if (v === "MUDANCA_CURSO" || v === "MUDANÇA DE CURSO" || v === "MUDANCA CURSO") return "MUDANCA_CURSO";
   if (v === "INCLUIR_APRIMORAMENTO" || v === "INCLUIR APRIMORAMENTO") return "INCLUIR_APRIMORAMENTO";
   if (v === "ADESAO_EDITAL" || v === "ADESAO EDITAL" || v === "ADESÃO POR PERDA DE PRAZO") return "ADESAO_EDITAL";
-  if (v === "DESCREDENCIAR VAGA" || v === "DESCREDENCIAR_VAGA" || v === "DESISTIR DA ADESAO") return "DESCREDENCIAR_VAGA";
+  if (v === "DESCREDENCIAR VAGA" || v === "DESCREDENCIAR_VAGA" || v === "DESISTIR DA ADESAO")
+    return "DESCREDENCIAR_VAGA";
 
   return v;
 }
@@ -81,11 +108,6 @@ async function getTetoCurso(client: any, cursoId: number): Promise<number> {
  * - AUMENTAR_VAGAS
  * - INCLUIR_APRIMORAMENTO
  * - ADESAO_EDITAL
- *
- * cursos.vagas = TETO fixo
- * disponivel = teto - saldoSolicitadoAtual
- *
- * IMPORTANTE: assume que a ação atual ainda NÃO foi inserida.
  */
 async function validarConsumoDeTeto(params: {
   client: any;
@@ -99,10 +121,7 @@ async function validarConsumoDeTeto(params: {
   // ✅ REGRA: incluir_aprimoramento é LIVRE (não valida teto/saldo)
   if (tipoAcao === "INCLUIR_APRIMORAMENTO") return;
 
-  const consomeTeto =
-    tipoAcao === "AUMENTAR_VAGAS" ||
-    tipoAcao === "ADESAO_EDITAL";
-
+  const consomeTeto = tipoAcao === "AUMENTAR_VAGAS" || tipoAcao === "ADESAO_EDITAL";
   if (!consomeTeto) return;
 
   const saldoAntes = await getSaldoSolicitadoCurso(client, cursoId, estabelecimentoId);
@@ -113,17 +132,20 @@ async function validarConsumoDeTeto(params: {
   if (quantidade > disponivel) throw new Error(`Você só pode aumentar até ${disponivel}`);
 }
 
-/** Resolve estabelecimento por CNES */
+/** ✅ Resolve estabelecimento por CNES (SEM completar com 0) */
 async function getEstByCnes(client: any, cnesValue: string) {
+  const cnesTrim = String(cnesValue ?? "").trim();
+
   const r = await client.query(
     `
     SELECT id, cnes, municipio_id, nome
     FROM recursos.estabelecimentos
-    WHERE cnes = $1
+    WHERE TRIM(cnes::text) = TRIM($1::text)
     LIMIT 1
     `,
-    [cnesValue]
+    [cnesTrim]
   );
+
   return r.rows[0] ?? null;
 }
 
@@ -175,12 +197,7 @@ async function validarUfDoMunicipio(client: any, municipioId: number, ufNorm: st
 }
 
 /** Resolve cursoId (por id ou por nome no estabelecimento). Pode criar no incluir_aprimoramento */
-async function resolveCursoId(params: {
-  client: any;
-  tipoAcao: string;
-  curso: CursoBody;
-  estabelecimentoId: number;
-}) {
+async function resolveCursoId(params: { client: any; tipoAcao: string; curso: CursoBody; estabelecimentoId: number }) {
   const { client, tipoAcao, curso, estabelecimentoId } = params;
 
   let cursoId: number | null = null;
@@ -216,7 +233,6 @@ async function resolveCursoId(params: {
     if (r.rows.length > 0) {
       cursoId = Number(r.rows[0].id);
     } else {
-      // só cria no INCLUIR_APRIMORAMENTO
       if (tipoAcao !== "INCLUIR_APRIMORAMENTO") {
         throw new Error(`Curso "${nomeCurso}" não existe no estabelecimento`);
       }
@@ -241,10 +257,6 @@ async function resolveCursoId(params: {
  * ✅ MUDANCA_CURSO por operação:
  * - REMOVER => gera DIMINUIR_VAGAS
  * - ADICIONAR => gera AUMENTAR_VAGAS
- *
- * Aceita:
- *  - cursosArr (compat antigo) com operacao
- *  - cursosRemover / cursosAdicionar (novo formato)
  */
 async function processarMudancaCursoPorOperacao(params: {
   client: any;
@@ -261,7 +273,7 @@ async function processarMudancaCursoPorOperacao(params: {
   let removerRaw: CursoBody[] = Array.isArray(params.cursosRemover) ? params.cursosRemover : [];
   let adicionarRaw: CursoBody[] = Array.isArray(params.cursosAdicionar) ? params.cursosAdicionar : [];
 
-  // fallback: se não veio no novo formato, tenta pelo antigo (cursosArr com operacao)
+  // fallback antigo
   if (removerRaw.length === 0 && adicionarRaw.length === 0) {
     const cursosArr = Array.isArray(params.cursosArr) ? params.cursosArr : [];
     removerRaw = cursosArr.filter((c) => normalizeUpper(c.operacao) === "REMOVER");
@@ -272,9 +284,11 @@ async function processarMudancaCursoPorOperacao(params: {
     throw new Error("Em Mudança de Curso, informe ao menos um curso para REMOVER e/ou ADICIONAR.");
   }
 
-  // 1) valida CNES único (mesmo estabelecimento) considerando remover+adicionar
+  // 1) valida CNES único (sem padStart)
   const all = [...removerRaw, ...adicionarRaw];
-  const cnesSet = new Set(all.map((c) => String(c.cnes ?? "").trim()).filter((x) => x.length > 0));
+
+  // ✅ ALTERADO: agora aceita qualquer tamanho, só precisa existir (>=1 dígito)
+  const cnesSet = new Set(all.map((c) => sanitizeCnes(c.cnes)).filter((x) => x.length >= 1));
 
   if (cnesSet.size !== 1) {
     throw new Error("Mudança de curso deve conter cursos de um único estabelecimento (mesmo CNES).");
@@ -317,7 +331,6 @@ async function processarMudancaCursoPorOperacao(params: {
   const totalRemover = [...removerMap.values()].reduce((s, v) => s + v, 0);
   const totalAdicionar = [...adicionarMap.values()].reduce((s, v) => s + v, 0);
 
-  // ✅ regra: manter total de vagas
   if (totalRemover !== totalAdicionar) {
     throw new Error(
       `Mudança de curso precisa manter o total de vagas: diminuir=${totalRemover} e aumentar=${totalAdicionar}.`
@@ -383,7 +396,7 @@ export async function listarCursosPorEstabelecimento(req: Request, res: Response
       SELECT
         c.id,
         c.nome,
-        c.vagas, -- teto (fixo)
+        c.vagas,
         GREATEST(
           COALESCE(SUM(CASE WHEN av.tipo_acao IN ('AUMENTAR_VAGAS','AUMENTAR VAGAS') THEN av.quantidade ELSE 0 END), 0)
           - COALESCE(SUM(CASE WHEN av.tipo_acao IN ('DIMINUIR_VAGAS','DIMINUIR VAGAS') THEN av.quantidade ELSE 0 END), 0),
@@ -438,6 +451,8 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
       cursosAdicionar,
       gestorId,
       cnes,
+      curso_id,
+      curso_nome,
     } = req.body;
 
     if (!tipoAcaoRaw) return res.status(400).json({ ok: false, error: "Tipo de ação é obrigatório" });
@@ -448,19 +463,23 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
     const ufNorm = normalizeUpper(ufSelecionada);
     if (!ufNorm) return res.status(400).json({ ok: false, error: "UF é obrigatória" });
 
-    // cursos compat (antigo)
     const cursosArr: CursoBody[] = Array.isArray(cursos) ? cursos : [];
 
-    // DESCREDENCIAR: não exige cursos
+    // ✅ validações por tipo
     if (tipoAcao === "DESCREDENCIAR_VAGA") {
       if (!motivoDescredenciar) {
         return res.status(400).json({ ok: false, error: "Motivo é obrigatório para desistir da adesão" });
       }
-      if (!cnes || !String(cnes).trim()) {
-        return res.status(400).json({ ok: false, error: "CNES do estabelecimento é obrigatório para desistir da adesão" });
+      // ✅ ALTERADO: aceita CNES de qualquer tamanho (desde que tenha dígitos)
+      if (!isValidCnes(cnes)) {
+        return res.status(400).json({ ok: false, error: "CNES do estabelecimento inválido" });
+      }
+      if (!curso_id || !String(curso_id).trim()) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "Aprimoramento (curso_id) é obrigatório para desistir da adesão" });
       }
     } else if (tipoAcao === "MUDANCA_CURSO") {
-      // ✅ em mudança, não exige cursosArr, pode vir no novo formato
       const rem = Array.isArray(cursosRemover) ? cursosRemover : [];
       const add = Array.isArray(cursosAdicionar) ? cursosAdicionar : [];
       const temAlgo = rem.length > 0 || add.length > 0 || cursosArr.some((c) => String(c.operacao ?? "").trim() !== "");
@@ -468,7 +487,6 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
         return res.status(400).json({ ok: false, error: "Informe ao menos um curso para mudança" });
       }
     } else {
-      // demais ações precisam ter cursos
       if (cursosArr.length === 0) {
         return res.status(400).json({ ok: false, error: "Informe ao menos um curso" });
       }
@@ -499,28 +517,49 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
       return rollbackAndReturn(400, { ok: false, error: err?.message || "UF inválida" });
     }
 
-    // DESCREDENCIAR_VAGA
+    // ✅ DESCREDENCIAR_VAGA
     if (tipoAcao === "DESCREDENCIAR_VAGA") {
-      const cnesValue = String(cnes).trim();
-      const est = await getEstByCnes(client, cnesValue);
+      const cnesClean = sanitizeCnes(cnes);
+      const est = await getEstByCnes(client, cnesClean);
 
       if (!est) {
-        return rollbackAndReturn(400, { ok: false, error: `Estabelecimento CNES "${cnesValue}" não encontrado` });
+        return rollbackAndReturn(400, { ok: false, error: `Estabelecimento CNES "${cnesClean}" não encontrado` });
       }
 
       if (Number(est.municipio_id) !== Number(municipioId)) {
         return rollbackAndReturn(400, { ok: false, error: "Estabelecimento não pertence ao município selecionado" });
       }
 
+      const cursoIdNum = toInt(curso_id);
+      if (!Number.isFinite(cursoIdNum)) {
+        return rollbackAndReturn(400, { ok: false, error: "curso_id inválido" });
+      }
+
+      const cursoCheck = await client.query(`SELECT id FROM recursos.cursos WHERE id = $1 AND estabelecimento_id = $2`, [
+        cursoIdNum,
+        Number(est.id),
+      ]);
+      if (cursoCheck.rows.length === 0) {
+        return rollbackAndReturn(400, { ok: false, error: "Aprimoramento não pertence ao estabelecimento selecionado" });
+      }
+
       const acaoResult = await client.query(
         `
-        INSERT INTO recursos.acoes_vagas
-          (gestor_id, tipo_acao, uf, municipio_id, estabelecimento_id, motivo_descredenciamento, data_criacao)
-        VALUES
-          ($1, $2, $3, $4, $5, $6, NOW())
-        RETURNING id
-        `,
-        [Number(gestorId), tipoAcao, ufNorm, municipioId, Number(est.id), String(motivoDescredenciar)]
+  INSERT INTO recursos.acoes_vagas
+    (gestor_id, tipo_acao, uf, municipio_id, estabelecimento_id, curso_id, motivo_descredenciamento, quantidade, data_criacao)
+  VALUES
+    ($1, $2, $3, $4, $5, $6, $7, 0, NOW())
+  RETURNING id
+  `,
+        [
+          Number(gestorId),
+          tipoAcao,
+          ufNorm,
+          municipioId,
+          Number(est.id),
+          cursoIdNum,
+          String(motivoDescredenciar),
+        ]
       );
 
       await client.query("COMMIT");
@@ -533,7 +572,7 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
       });
     }
 
-    // ✅ MUDANCA_CURSO: traduz em AUMENTAR/DIMINUIR automaticamente
+    // ✅ MUDANCA_CURSO
     if (tipoAcao === "MUDANCA_CURSO") {
       try {
         const { acaoIdsCriados, estabelecimentoId } = await processarMudancaCursoPorOperacao({
@@ -541,9 +580,9 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
           gestorId: Number(gestorId),
           ufNorm,
           municipioId,
-          cursosArr, // compat antigo
-          cursosRemover: Array.isArray(cursosRemover) ? cursosRemover : undefined, // novo
-          cursosAdicionar: Array.isArray(cursosAdicionar) ? cursosAdicionar : undefined, // novo
+          cursosArr,
+          cursosRemover: Array.isArray(cursosRemover) ? cursosRemover : undefined,
+          cursosAdicionar: Array.isArray(cursosAdicionar) ? cursosAdicionar : undefined,
         });
 
         await client.query("COMMIT");
@@ -560,73 +599,72 @@ export async function criarAcaoVagasFormularioSemAuth(req: Request, res: Respons
       }
     }
 
-    // ✅ Demais ações: fluxo original (insere tipoAcao diretamente)
+    // ✅ Demais ações
     const acaoIdsCriados: number[] = [];
 
-    for (const curso of cursosArr) {
-      const quantidade = Number(curso.quantidade);
-      if (!isFinitePositive(quantidade)) {
-        return rollbackAndReturn(400, { ok: false, error: `Quantidade inválida para o curso "${curso.nome ?? curso.id}"` });
-      }
+if (tipoAcao !== "DESCREDENCIAR_VAGA") {
+  for (const curso of cursosArr) {
+    const quantidade = Number(curso.quantidade);
 
-      const cnesItem = String(curso.cnes ?? "").trim();
-      if (!cnesItem) {
-        return rollbackAndReturn(400, { ok: false, error: "CNES é obrigatório em cada curso enviado" });
-      }
-
-      const est = await getEstByCnes(client, cnesItem);
-      if (!est) {
-        return rollbackAndReturn(400, { ok: false, error: `Estabelecimento CNES "${cnesItem}" não encontrado` });
-      }
-
-      if (Number(est.municipio_id) !== Number(municipioId)) {
-        return rollbackAndReturn(400, {
-          ok: false,
-          error: `Estabelecimento (CNES ${cnesItem}) não pertence ao município selecionado`,
-        });
-      }
-
-      const estabelecimentoId = Number(est.id);
-
-      // resolve cursoId
-      let cursoId: number;
-      try {
-        cursoId = await resolveCursoId({ client, tipoAcao, curso, estabelecimentoId });
-      } catch (err: any) {
-        return rollbackAndReturn(400, { ok: false, error: err?.message || "Curso inválido" });
-      }
-
-      // valida diminuir
-      if (tipoAcao === "DIMINUIR_VAGAS") {
-        const saldo = await getSaldoSolicitadoCurso(client, cursoId, estabelecimentoId);
-        if (saldo <= 0) {
-          return rollbackAndReturn(400, { ok: false, error: "Não há vagas solicitadas para diminuir" });
-        }
-        if (quantidade > saldo) {
-          return rollbackAndReturn(400, { ok: false, error: `Você só pode diminuir até ${saldo}` });
-        }
-      }
-
-      // valida consumo de teto (antes do insert)
-      try {
-        await validarConsumoDeTeto({ client, tipoAcao, cursoId, estabelecimentoId, quantidade });
-      } catch (err: any) {
-        return rollbackAndReturn(400, { ok: false, error: err?.message || "Saldo insuficiente" });
-      }
-
-      const createdAcao = await client.query(
-        `
-        INSERT INTO recursos.acoes_vagas
-          (gestor_id, tipo_acao, uf, municipio_id, estabelecimento_id, curso_id, quantidade, data_criacao)
-        VALUES
-          ($1, $2, $3, $4, $5, $6, $7, NOW())
-        RETURNING id
-        `,
-        [Number(gestorId), tipoAcao, ufNorm, municipioId, estabelecimentoId, cursoId, quantidade]
-      );
-
-      acaoIdsCriados.push(Number(createdAcao.rows[0].id));
+    if (!isFinitePositive(quantidade)) {
+      return rollbackAndReturn(400, {
+        ok: false,
+        error: `Quantidade inválida para o curso "${curso.nome ?? curso.id}"`,
+      });
     }
+
+    const cnesItem = sanitizeCnes(curso.cnes);
+    if (!cnesItem) {
+      return rollbackAndReturn(400, { ok: false, error: "CNES é obrigatório em cada curso enviado" });
+    }
+
+    const est = await getEstByCnes(client, cnesItem);
+    if (!est) {
+      return rollbackAndReturn(400, { ok: false, error: `Estabelecimento CNES "${cnesItem}" não encontrado` });
+    }
+
+    if (Number(est.municipio_id) !== Number(municipioId)) {
+      return rollbackAndReturn(400, {
+        ok: false,
+        error: `Estabelecimento (CNES ${cnesItem}) não pertence ao município selecionado`,
+      });
+    }
+
+    const estabelecimentoId = Number(est.id);
+
+    let cursoId: number;
+    try {
+      cursoId = await resolveCursoId({ client, tipoAcao, curso, estabelecimentoId });
+    } catch (err: any) {
+      return rollbackAndReturn(400, { ok: false, error: err?.message || "Curso inválido" });
+    }
+
+    if (tipoAcao === "DIMINUIR_VAGAS") {
+      const saldo = await getSaldoSolicitadoCurso(client, cursoId, estabelecimentoId);
+      if (saldo <= 0) {
+        return rollbackAndReturn(400, { ok: false, error: "Não há vagas solicitadas para diminuir" });
+      }
+      if (quantidade > saldo) {
+        return rollbackAndReturn(400, { ok: false, error: `Você só pode diminuir até ${saldo}` });
+      }
+    }
+
+    await validarConsumoDeTeto({ client, tipoAcao, cursoId, estabelecimentoId, quantidade });
+
+    const createdAcao = await client.query(
+      `
+      INSERT INTO recursos.acoes_vagas
+        (gestor_id, tipo_acao, uf, municipio_id, estabelecimento_id, curso_id, quantidade, data_criacao)
+      VALUES
+        ($1, $2, $3, $4, $5, $6, $7, NOW())
+      RETURNING id
+      `,
+      [Number(gestorId), tipoAcao, ufNorm, municipioId, estabelecimentoId, cursoId, quantidade]
+    );
+
+    acaoIdsCriados.push(Number(createdAcao.rows[0].id));
+  }
+}
 
     await client.query("COMMIT");
 
