@@ -11,7 +11,7 @@ const isProd = process.env.RAILWAY_ENVIRONMENT === "production";
 
 // ✅ paths absolutos e consistentes
 const LOCAL_TEST_DIR = path.join(__dirname, "uploads"); // em dev
-const PROD_DIR = path.join(process.cwd(), "uploads"); // em prod (Railway)
+const PROD_DIR = path.join(process.cwd(), "/uploads"); // em prod (Railway)
 
 const UPLOAD_DIR = isProd ? PROD_DIR : LOCAL_TEST_DIR;
 
