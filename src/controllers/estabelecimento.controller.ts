@@ -6,13 +6,8 @@ type NivelGestaoNorm = "MUNICIPAL" | "ESTADUAL" | "";
 // normaliza o que vem do front (municipal/estadual ou MUNICIPAL/ESTADUAL)
 function normNivel(v: unknown): NivelGestaoNorm {
   const s = String(v ?? "").trim().toUpperCase();
-  if (s === "MUNICIPAL" || s === "MUNICIPAL ") return "MUNICIPAL";
-  if (s === "ESTADUAL" || s === "ESTADUAL ") return "ESTADUAL";
-
-  // se vier do front como "municipal"/"estadual"
   if (s === "MUNICIPAL") return "MUNICIPAL";
   if (s === "ESTADUAL") return "ESTADUAL";
-
   return "";
 }
 
@@ -59,7 +54,7 @@ export async function listarEstabelecimentos(req: Request, res: Response) {
       filtros.push(`
         (
           ${NG_COL} = $${idx}
-          OR ${NG_COL} IN ('DOBRO','AMBOS','MISTO','DUPLO')
+          OR ${NG_COL} IN ('DOBRO','AMBOS','MISTO','DUPLO','DUPLA')
           OR ${NG_COL} LIKE '%' || $${idx} || '%'
         )
       `);
