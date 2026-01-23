@@ -10,15 +10,19 @@ const router = Router();
 const isProd = process.env.RAILWAY_ENVIRONMENT === "production";
 
 // ✅ paths absolutos e consistentes
-const LOCAL_TEST_DIR = path.join(__dirname, "/uploads");        // ex: src/uploads (depende de build)
-const PROD_DIR = path.join(process.cwd(), "uploads");            // ex: /app/uploads no Railway
+const LOCAL_TEST_DIR = path.join(__dirname, "/uploads"); // em dev
+const PROD_DIR = path.join(process.cwd(), "uploads"); // em prod (Railway)
 
 const UPLOAD_DIR = isProd ? PROD_DIR : LOCAL_TEST_DIR;
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
+/**
+ * ✅ CNES: NÃO normaliza, NÃO valida tamanho, NÃO restringe a números.
+ * Regra: só precisa existir (não vazio).
+ */
 function isValidCNES(value: unknown) {
-  return typeof value === "string" && /^\d{7}$/.test(value);
+  return String(value ?? "").trim().length > 0;
 }
 
 function sanitizeBaseName(name: string) {
@@ -45,10 +49,7 @@ const upload = multer({
   storage,
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (
-      file.mimetype !== "application/pdf" &&
-      !file.originalname.toLowerCase().endsWith(".pdf")
-    ) {
+    if (file.mimetype !== "application/pdf" && !file.originalname.toLowerCase().endsWith(".pdf")) {
       return cb(new Error("Apenas PDF é permitido"));
     }
     cb(null, true);
@@ -60,12 +61,14 @@ router.post("/", upload.single("file"), (req, res) => {
   try {
     const cnes = String(req.body?.cnes ?? "").trim();
 
+    // ✅ NÃO valida tamanho, apenas exige que exista
     if (!isValidCNES(cnes)) {
+      // limpa tmp se existir
       if (req.file?.filename) {
         const tmpPath = path.join(UPLOAD_DIR, req.file.filename);
         if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
       }
-      return res.status(400).json({ ok: false, message: "CNES inválido (7 dígitos)" });
+      return res.status(400).json({ ok: false, message: "CNES é obrigatório" });
     }
 
     if (!req.file) {
@@ -74,7 +77,13 @@ router.post("/", upload.single("file"), (req, res) => {
 
     const originalBase = sanitizeBaseName(req.file.originalname);
     const ext = (path.extname(req.file.originalname) || ".pdf").toLowerCase();
-    const finalName = `${originalBase}__CNES-${cnes}__${Date.now()}${ext}`;
+
+    // ✅ CNES pode ter vários formatos/tamanhos → preservar como veio
+    // Mas precisamos evitar caracteres perigosos no NOME DO ARQUIVO.
+    // Então: no filename, substitui caracteres que podem quebrar path.
+    const cnesSafe = cnes.replace(/[^\w.-]/g, "_");
+
+    const finalName = `${originalBase}__CNES-${cnesSafe}__${Date.now()}${ext}`;
 
     const oldPath = path.join(UPLOAD_DIR, req.file.filename);
     const newPath = path.join(UPLOAD_DIR, finalName);
@@ -84,7 +93,7 @@ router.post("/", upload.single("file"), (req, res) => {
       ok: true,
       filename: finalName,
       originalname: req.file.originalname,
-      cnes,
+      cnes, // ✅ valor real enviado (sem normalização)
       url: `/uploads/${encodeURIComponent(finalName)}`,
     });
   } catch (err: any) {
@@ -95,7 +104,6 @@ router.post("/", upload.single("file"), (req, res) => {
 // ✅ GET /uploads/:filename — visualizar/baixar PDF (INLINE)
 router.get("/:filename", (req, res) => {
   try {
-    // ✅ decode primeiro
     const decoded = decodeURIComponent(String(req.params.filename || ""));
 
     if (decoded.includes("..") || decoded.includes("/") || decoded.includes("\\")) {
@@ -132,8 +140,16 @@ router.get("/", async (_req, res) => {
         const fullPath = path.join(UPLOAD_DIR, filename);
         const st = fs.statSync(fullPath);
 
-        const match = filename.match(/__CNES-(\d{7})__/);
-        const cnes = match?.[1] ?? null;
+        // ✅ agora aceita CNES de qualquer formato/tamanho
+        // pega tudo entre "__CNES-" e "__"
+        const match = filename.match(/__CNES-(.+?)__/);
+        const cnesFromFileSafe = match?.[1] ?? null;
+
+        // OBS: no nome do arquivo foi salvo como cnesSafe, não necessariamente igual ao cnes real
+        // (pq trocamos caracteres perigosos por "_")
+        // Então para enriquecimento no banco, só faz sentido se o CNES for “texto compatível” com o banco.
+        // Se o seu CNES do banco é somente números, o ideal é CNES numérico no front/back.
+        const cnes = cnesFromFileSafe;
 
         return {
           filename,
@@ -144,20 +160,16 @@ router.get("/", async (_req, res) => {
         };
       });
 
-    const cnesList = Array.from(
-      new Set(baseList.map((x) => x.cnes).filter((x): x is string => !!x && /^\d{7}$/.test(x)))
-    );
+    // ✅ sem filtro por tamanho
+    const cnesList = Array.from(new Set(baseList.map((x) => x.cnes).filter((x): x is string => !!x)));
 
-    let metaByCnes: Record<
-      string,
-      { estabelecimento: string; municipio: string; uf: string; ibge: string }
-    > = {};
+    let metaByCnes: Record<string, { estabelecimento: string; municipio: string; uf: string; ibge: string }> = {};
 
     if (cnesList.length > 0) {
       const result = await pool.query(
         `
         SELECT
-          e.cnes,
+          e.cnes::text as cnes,
           e.nome AS estabelecimento,
           m.nome AS municipio,
           m.ibge,
@@ -165,7 +177,7 @@ router.get("/", async (_req, res) => {
         FROM recursos.estabelecimentos e
         JOIN recursos.municipios m ON m.id = e.municipio_id
         JOIN recursos.estados es   ON es.id = m.estado_id
-        WHERE e.cnes = ANY($1::text[])
+        WHERE e.cnes::text = ANY($1::text[])
         `,
         [cnesList]
       );
