@@ -7,11 +7,13 @@ import { pool } from "../db/pool";
 
 const router = Router();
 
-const isProd = process.env.RAILWAY_ENVIRONMENT === "production";
+const isProd =
+  process.env.RAILWAY_ENVIRONMENT === "production" || process.env.NODE_ENV === "production";
 
 // ✅ paths absolutos e consistentes
-const LOCAL_TEST_DIR = path.join(process.cwd(), "upload"); // em dev
-const PROD_DIR = path.join(process.cwd(), "uploads"); // em prod (Railway)
+const LOCAL_TEST_DIR = path.join(process.cwd(), "uploads"); // em dev
+const DEFAULT_PROD_DIR = fs.existsSync("/uploads") ? "/uploads" : path.join(process.cwd(), "uploads");
+const PROD_DIR = process.env.UPLOAD_DIR ?? DEFAULT_PROD_DIR; // em prod (Railway)
 
 const UPLOAD_DIR = isProd ? PROD_DIR : LOCAL_TEST_DIR;
 const ASSINADOS_FILE = path.join(UPLOAD_DIR, "assinados.json");

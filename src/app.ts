@@ -9,10 +9,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const UPLOAD_DIR =
-  process.env.NODE_ENV === "production"
-    ? path.join(process.cwd(), "uploads")    
-    : path.join(__dirname, "../uploads");    
+const isProd =
+  process.env.RAILWAY_ENVIRONMENT === "production" || process.env.NODE_ENV === "production";
+const DEFAULT_PROD_DIR = fs.existsSync("/uploads") ? "/uploads" : path.join(process.cwd(), "uploads");
+const UPLOAD_DIR = isProd ? process.env.UPLOAD_DIR ?? DEFAULT_PROD_DIR : path.join(__dirname, "../uploads");
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
