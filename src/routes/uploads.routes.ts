@@ -10,12 +10,13 @@ const router = Router();
 const isProd = process.env.RAILWAY_ENVIRONMENT === "production";
 
 // ✅ paths absolutos e consistentes
-const LOCAL_TEST_DIR = path.join(__dirname, "uploads"); // em dev
-const PROD_DIR = "/uploads";  // em prod (Railway)
+const LOCAL_TEST_DIR = path.join(process.cwd(), "uploads"); // em dev
+const PROD_DIR = path.join(process.cwd(), "uploads"); // em prod (Railway)
 
 const UPLOAD_DIR = isProd ? PROD_DIR : LOCAL_TEST_DIR;
+const ASSINADOS_FILE = path.join(UPLOAD_DIR, "assinados.json");
 
-fs.mkdirSync(PROD_DIR, { recursive: true });
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 /**
  * ✅ CNES: NÃO normaliza, NÃO valida tamanho, NÃO restringe a números.
@@ -35,6 +36,37 @@ function sanitizeBaseName(name: string) {
     .trim();
 
   return (base || "arquivo").slice(0, 80);
+}
+
+function readAssinados(): Record<string, boolean> {
+  try {
+    if (!fs.existsSync(ASSINADOS_FILE)) return {};
+    const raw = fs.readFileSync(ASSINADOS_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed ? (parsed as Record<string, boolean>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeAssinados(map: Record<string, boolean>) {
+  const tmp = `${ASSINADOS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(map, null, 2), "utf8");
+  fs.renameSync(tmp, ASSINADOS_FILE);
+}
+
+function replaceCnesInFilename(filename: string, cnesSafe: string) {
+  const ext = path.extname(filename) || ".pdf";
+  const base = path.basename(filename, ext);
+  const match = base.match(/^(.*)__CNES-(.+?)__(\d+)$/);
+
+  if (match) {
+    const prefix = match[1] || "arquivo";
+    const ts = match[3] || String(Date.now());
+    return `${prefix}__CNES-${cnesSafe}__${ts}${ext}`;
+  }
+
+  return `${base}__CNES-${cnesSafe}__${Date.now()}${ext}`;
 }
 
 const storage = multer.diskStorage({
@@ -101,6 +133,131 @@ router.post("/", upload.single("file"), (req, res) => {
   }
 });
 
+// ✅ GET /uploads/assinados — mapa de assinados (compartilhado)
+router.get("/assinados", (_req, res) => {
+  try {
+    const map = readAssinados();
+    return res.json({ ok: true, map });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, message: err?.message || "Erro ao ler assinados" });
+  }
+});
+
+// ✅ POST /uploads/assinados — atualiza status de um arquivo
+router.post("/assinados", (req, res) => {
+  try {
+    const filename = String(req.body?.filename ?? "").trim();
+    const assinado = Boolean(req.body?.assinado);
+
+    if (!filename) {
+      return res.status(400).json({ ok: false, message: "filename é obrigatório" });
+    }
+
+    if (filename.includes("..") || filename.includes("/") || filename.includes("\\")) {
+      return res.status(400).json({ ok: false, message: "Nome de arquivo inválido" });
+    }
+
+    if (!filename.toLowerCase().endsWith(".pdf")) {
+      return res.status(400).json({ ok: false, message: "Apenas PDF" });
+    }
+
+    const map = readAssinados();
+    map[filename] = assinado;
+    writeAssinados(map);
+
+    return res.json({ ok: true, filename, assinado });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, message: err?.message || "Erro ao salvar assinado" });
+  }
+});
+
+// ✅ POST /uploads/metadata — atualizar CNES do arquivo
+router.post("/metadata", (req, res) => {
+  try {
+    const filename = String(req.body?.filename ?? "").trim();
+    const cnes = String(req.body?.cnes ?? "").trim();
+
+    if (!filename) {
+      return res.status(400).json({ ok: false, message: "filename é obrigatório" });
+    }
+
+    if (!isValidCNES(cnes)) {
+      return res.status(400).json({ ok: false, message: "CNES é obrigatório" });
+    }
+
+    if (filename.includes("..") || filename.includes("/") || filename.includes("\\")) {
+      return res.status(400).json({ ok: false, message: "Nome de arquivo inválido" });
+    }
+
+    if (!filename.toLowerCase().endsWith(".pdf")) {
+      return res.status(400).json({ ok: false, message: "Apenas PDF" });
+    }
+
+    const currentPath = path.join(UPLOAD_DIR, filename);
+    if (!fs.existsSync(currentPath)) {
+      return res.status(404).json({ ok: false, message: "Arquivo não encontrado" });
+    }
+
+    const cnesSafe = cnes.replace(/[^\w.-]/g, "_");
+    let newFilename = replaceCnesInFilename(filename, cnesSafe);
+    let newPath = path.join(UPLOAD_DIR, newFilename);
+
+    if (fs.existsSync(newPath)) {
+      const ext = path.extname(newFilename) || ".pdf";
+      const base = path.basename(newFilename, ext);
+      newFilename = `${base}__${Date.now()}${ext}`;
+      newPath = path.join(UPLOAD_DIR, newFilename);
+    }
+
+    fs.renameSync(currentPath, newPath);
+
+    const map = readAssinados();
+    if (map[filename] !== undefined) {
+      map[newFilename] = map[filename];
+      delete map[filename];
+      writeAssinados(map);
+    }
+
+    return res.json({ ok: true, filename: newFilename, cnes });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ ok: false, message: err?.message || "Erro ao atualizar metadado" });
+  }
+});
+
+// ✅ DELETE /uploads/:filename — excluir PDF
+router.delete("/:filename", (req, res) => {
+  try {
+    const decoded = decodeURIComponent(String(req.params.filename || ""));
+
+    if (decoded.includes("..") || decoded.includes("/") || decoded.includes("\\")) {
+      return res.status(400).json({ ok: false, message: "Nome de arquivo inválido" });
+    }
+
+    if (!decoded.toLowerCase().endsWith(".pdf")) {
+      return res.status(400).json({ ok: false, message: "Apenas PDF" });
+    }
+
+    const filePath = path.join(UPLOAD_DIR, decoded);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ ok: false, message: "Arquivo não encontrado" });
+    }
+
+    fs.unlinkSync(filePath);
+
+    const map = readAssinados();
+    if (map[decoded] !== undefined) {
+      delete map[decoded];
+      writeAssinados(map);
+    }
+
+    return res.json({ ok: true, filename: decoded });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, message: err?.message || "Erro ao excluir PDF" });
+  }
+});
+
 // ✅ GET /uploads/:filename — visualizar/baixar PDF (INLINE)
 router.get("/:filename", (req, res) => {
   try {
@@ -128,11 +285,11 @@ router.get("/:filename", (req, res) => {
     return res.status(500).json({ ok: false, message: err?.message || "Erro ao abrir PDF" });
   }
 });
-
 // ✅ GET /uploads — listar PDFs (ENRIQUECIDO com municipio/uf)
 router.get("/", async (_req, res) => {
   try {
     const files = fs.readdirSync(UPLOAD_DIR);
+    const assinadosMap = readAssinados();
 
     const baseList = files
       .filter((f) => f.toLowerCase().endsWith(".pdf"))
@@ -157,6 +314,7 @@ router.get("/", async (_req, res) => {
           sizeKB: Number((st.size / 1024).toFixed(2)),
           createdAt: st.birthtime,
           url: `/uploads/${encodeURIComponent(filename)}`,
+          assinado: Boolean(assinadosMap[filename]),
         };
       });
 
