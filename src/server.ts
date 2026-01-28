@@ -9,9 +9,12 @@ app.listen(8080, () => {
 
 
 
+const isProd =
+  process.env.RAILWAY_ENVIRONMENT === "production" || process.env.NODE_ENV === "production";
 const LOCAL_TEST_DIR = path.join(__dirname, "../uploads");
-const PROD_DIR = path.join(process.cwd(), "uploads");
-const UPLOAD_DIR = process.env.NODE_ENV === "production" ? PROD_DIR : LOCAL_TEST_DIR;
+const DEFAULT_PROD_DIR = fs.existsSync("/uploads") ? "/uploads" : path.join(process.cwd(), "uploads");
+const PROD_DIR = process.env.UPLOAD_DIR ?? DEFAULT_PROD_DIR;
+const UPLOAD_DIR = isProd ? PROD_DIR : LOCAL_TEST_DIR;
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
