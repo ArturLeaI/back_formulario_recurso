@@ -5,9 +5,16 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
 const cors_1 = __importDefault(require("cors"));
+const path_1 = __importDefault(require("path"));
+const fs_1 = __importDefault(require("fs"));
 const routes_1 = __importDefault(require("./routes"));
 const app = (0, express_1.default)();
 app.use((0, cors_1.default)());
 app.use(express_1.default.json());
+const isProd = process.env.RAILWAY_ENVIRONMENT === "production" || process.env.NODE_ENV === "production";
+const DEFAULT_PROD_DIR = fs_1.default.existsSync("/uploads") ? "/uploads" : path_1.default.join(process.cwd(), "uploads");
+const UPLOAD_DIR = isProd ? process.env.UPLOAD_DIR ?? DEFAULT_PROD_DIR : path_1.default.join(__dirname, "../uploads");
+fs_1.default.mkdirSync(UPLOAD_DIR, { recursive: true });
+app.use("/uploads", express_1.default.static(UPLOAD_DIR));
 app.use(routes_1.default);
 exports.default = app;

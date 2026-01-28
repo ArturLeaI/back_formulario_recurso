@@ -11,18 +11,13 @@ const isProd =
   process.env.RAILWAY_ENVIRONMENT === "production" || process.env.NODE_ENV === "production";
 
 // ✅ paths absolutos e consistentes
-<<<<<<< HEAD
-const LOCAL_TEST_DIR = path.join(__dirname, "uploads"); // em dev
-const PROD_DIR = "/uploads";  // em prod (Railway)
-=======
 const LOCAL_TEST_DIR = path.join(process.cwd(), "uploads"); // em dev
 const DEFAULT_PROD_DIR = fs.existsSync("/uploads") ? "/uploads" : path.join(process.cwd(), "uploads");
 const PROD_DIR = process.env.UPLOAD_DIR ?? DEFAULT_PROD_DIR; // em prod (Railway)
->>>>>>> b5a480af518dd2899b73bfba67ce5cec5ce864d5
 
 const UPLOAD_DIR = isProd ? PROD_DIR : LOCAL_TEST_DIR;
 
-fs.mkdirSync(PROD_DIR, { recursive: true });
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 /**
  * ✅ CNES: NÃO normaliza, NÃO valida tamanho, NÃO restringe a números.
