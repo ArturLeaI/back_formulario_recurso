@@ -6,7 +6,10 @@ import {
 
 const router = Router();
 
+// GET /localidades/estados
 router.get("/estados", listarEstados);
+
+// GET /localidades/municipios?uf=SP
 router.get("/municipios", listarMunicipiosPorUF);
 
 export default router;
