@@ -37,6 +37,11 @@ function sanitizeBaseName(name: string) {
   return (base || "arquivo").slice(0, 80);
 }
 
+function sanitizeCnesForMatch(value: unknown) {
+  const onlyDigits = String(value ?? "").replace(/\D+/g, "");
+  return onlyDigits.length ? onlyDigits : "";
+}
+
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
   filename: (_req, file, cb) => {
@@ -144,6 +149,7 @@ router.get("/", async (_req, res) => {
         // pega tudo entre "__CNES-" e "__"
         const match = filename.match(/__CNES-(.+?)__/);
         const cnesFromFileSafe = match?.[1] ?? null;
+        const cnesForMatch = cnesFromFileSafe ? sanitizeCnesForMatch(cnesFromFileSafe) : null;
 
         // OBS: no nome do arquivo foi salvo como cnesSafe, não necessariamente igual ao cnes real
         // (pq trocamos caracteres perigosos por "_")
@@ -154,6 +160,7 @@ router.get("/", async (_req, res) => {
         return {
           filename,
           cnes,
+          cnes_match: cnesForMatch,
           sizeKB: Number((st.size / 1024).toFixed(2)),
           createdAt: st.birthtime,
           url: `/uploads/${encodeURIComponent(filename)}`,
@@ -161,7 +168,9 @@ router.get("/", async (_req, res) => {
       });
 
     // ✅ sem filtro por tamanho
-    const cnesList = Array.from(new Set(baseList.map((x) => x.cnes).filter((x): x is string => !!x)));
+    const cnesList = Array.from(
+      new Set(baseList.map((x) => x.cnes_match).filter((x): x is string => !!x))
+    );
 
     let metaByCnes: Record<
       string,
@@ -181,13 +190,14 @@ router.get("/", async (_req, res) => {
         FROM recursos.estabelecimentos e
         JOIN recursos.municipios m ON m.id = e.municipio_id
         JOIN recursos.estados es   ON es.id = m.estado_id
-        WHERE e.cnes::text = ANY($1::text[])
+        WHERE NULLIF(regexp_replace(e.cnes::text, '\\D', '', 'g'), '')::numeric = ANY($1::numeric[])
         `,
         [cnesList]
       );
 
       for (const r of result.rows) {
-        metaByCnes[String(r.cnes)] = {
+        const key = sanitizeCnesForMatch(r.cnes);
+        metaByCnes[key] = {
           estabelecimento: r.estabelecimento,
           municipio: r.municipio,
           uf: r.uf,
@@ -198,9 +208,10 @@ router.get("/", async (_req, res) => {
     }
 
     const pdfs = baseList.map((p) => {
-      const meta = p.cnes ? metaByCnes[p.cnes] : undefined;
+      const meta = p.cnes_match ? metaByCnes[p.cnes_match] : undefined;
       return {
         ...p,
+        cnes_match: undefined,
         estabelecimento: meta?.estabelecimento ?? null,
         municipio: meta?.municipio ?? null,
         uf: meta?.uf ?? null,
